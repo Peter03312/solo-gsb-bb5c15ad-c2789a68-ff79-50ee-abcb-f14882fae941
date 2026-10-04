@@ -131,6 +131,38 @@ CREATE TABLE delivery_archives (
 );
 
 -- ----------------------------------------------------------------------------
+-- 签收邀请表：交付方（持管理密钥）按归档包编号、收件人与未来截止时刻创建。
+-- invitation_no 为服务端生成的随机邀请编号（业务键）；签收所需的一次性随机
+-- 密钥仅返回给交付方一次，库内只保存其 SHA-256 指纹（key_hash），明文不落库。
+-- 同一归档包可先后创建多份邀请（重发/换人），邀请一经创建只增不改。
+-- ----------------------------------------------------------------------------
+CREATE TABLE signoff_invitations (
+    invitation_no TEXT PRIMARY KEY,                -- 邀请编号（服务端随机生成，业务唯一）
+    archive_no    TEXT NOT NULL REFERENCES delivery_archives(archive_no),
+    recipient     TEXT NOT NULL,                   -- 收件人标识
+    deadline      TIMESTAMPTZ NOT NULL,            -- 签收截止时刻（创建时校验为未来）
+    key_hash      TEXT NOT NULL,                   -- 一次性密钥的 SHA-256 指纹（明文不持久化）
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_signoff_invitations_archive ON signoff_invitations(archive_no);
+
+-- ----------------------------------------------------------------------------
+-- 签收定稿记录表：每个归档包至多一份定稿（archive_no 主键），一旦提交只增不改。
+-- decision=ACCEPT 时 reason 为空；decision=REJECT 时 reason 必填（拒收原因）。
+-- 定稿是一次性快照：之后证书再被撤销也不改写本记录；同邀请同内容重试（即使
+-- 已过截止时刻）原样返回首次结果；不同内容或由其他邀请再提交报冲突。
+-- ----------------------------------------------------------------------------
+CREATE TABLE signoff_records (
+    archive_no    TEXT PRIMARY KEY REFERENCES delivery_archives(archive_no),
+    invitation_no TEXT NOT NULL REFERENCES signoff_invitations(invitation_no),
+    recipient     TEXT NOT NULL,                   -- 定稿时使用的邀请所声明的收件人
+    decision      TEXT NOT NULL CHECK (decision IN ('ACCEPT', 'REJECT')),
+    reason        TEXT,
+    request_hash  TEXT NOT NULL,                   -- 规范化提交内容（结论+原因）的 SHA-256
+    signed_at     TIMESTAMPTZ NOT NULL DEFAULT now()  -- 签收时刻
+);
+
+-- ----------------------------------------------------------------------------
 -- 更正声明表：针对已签发证书的展示字段（设备名称/操作员/备注）登记更正声明。
 -- declaration_no 为幂等键（全局唯一）；seq 为同一证书内按成功登记顺序分配的
 -- 序号（从 1 开始），合并展示时按 seq 升序逐条覆盖生效。corrections 仅保存
@@ -225,6 +257,22 @@ CREATE TRIGGER trg_delivery_archives_no_update
 
 CREATE TRIGGER trg_delivery_archives_no_delete
     BEFORE DELETE ON delivery_archives
+    FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
+
+CREATE TRIGGER trg_signoff_invitations_no_update
+    BEFORE UPDATE ON signoff_invitations
+    FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
+
+CREATE TRIGGER trg_signoff_invitations_no_delete
+    BEFORE DELETE ON signoff_invitations
+    FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
+
+CREATE TRIGGER trg_signoff_records_no_update
+    BEFORE UPDATE ON signoff_records
+    FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
+
+CREATE TRIGGER trg_signoff_records_no_delete
+    BEFORE DELETE ON signoff_records
     FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
 
 -- ----------------------------------------------------------------------------

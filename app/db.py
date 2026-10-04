@@ -49,6 +49,31 @@ CREATE TABLE IF NOT EXISTS correction_declarations (
 );
 """,
     """
+CREATE TABLE IF NOT EXISTS signoff_invitations (
+    invitation_no TEXT PRIMARY KEY,
+    archive_no    TEXT NOT NULL REFERENCES delivery_archives(archive_no),
+    recipient     TEXT NOT NULL,
+    deadline      TIMESTAMPTZ NOT NULL,
+    key_hash      TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+""",
+    """
+CREATE INDEX IF NOT EXISTS idx_signoff_invitations_archive
+    ON signoff_invitations(archive_no);
+""",
+    """
+CREATE TABLE IF NOT EXISTS signoff_records (
+    archive_no    TEXT PRIMARY KEY REFERENCES delivery_archives(archive_no),
+    invitation_no TEXT NOT NULL REFERENCES signoff_invitations(invitation_no),
+    recipient     TEXT NOT NULL,
+    decision      TEXT NOT NULL CHECK (decision IN ('ACCEPT', 'REJECT')),
+    reason        TEXT,
+    request_hash  TEXT NOT NULL,
+    signed_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+""",
+    """
 CREATE OR REPLACE FUNCTION append_only_sealed() RETURNS trigger AS $$
 BEGIN
     RAISE EXCEPTION '% is append-only and sealed (trigger=%)', TG_TABLE_NAME, TG_NAME
@@ -74,6 +99,26 @@ CREATE OR REPLACE TRIGGER trg_delivery_archives_no_update
     """
 CREATE OR REPLACE TRIGGER trg_delivery_archives_no_delete
     BEFORE DELETE ON delivery_archives
+    FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
+""",
+    """
+CREATE OR REPLACE TRIGGER trg_signoff_invitations_no_update
+    BEFORE UPDATE ON signoff_invitations
+    FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
+""",
+    """
+CREATE OR REPLACE TRIGGER trg_signoff_invitations_no_delete
+    BEFORE DELETE ON signoff_invitations
+    FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
+""",
+    """
+CREATE OR REPLACE TRIGGER trg_signoff_records_no_update
+    BEFORE UPDATE ON signoff_records
+    FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
+""",
+    """
+CREATE OR REPLACE TRIGGER trg_signoff_records_no_delete
+    BEFORE DELETE ON signoff_records
     FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
 """,
 )

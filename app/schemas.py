@@ -133,6 +133,57 @@ class DeliveryArchiveRequest(BaseModel):
     )
 
 
+class SignoffInvitationRequest(BaseModel):
+    """交付方创建签收邀请：指定归档包编号、收件人与未来截止时刻。
+
+    须携带管理密钥（X-Admin-Key）；归档包不存在或截止时刻非未来值时拒绝。
+    成功后返回邀请编号与仅展示一次的随机签收密钥（明文不落库）。
+    """
+    archive_no: str = Field(
+        ..., min_length=1, max_length=128, description="已创建的交付归档包编号"
+    )
+    recipient: str = Field(
+        ..., min_length=1, max_length=256,
+        description="收件人标识（非空，按原值保存）",
+    )
+    deadline: datetime = Field(
+        ...,
+        description="签收截止时刻（含），必须为带时区的未来时刻，如 2026-10-10T18:00:00+08:00",
+    )
+
+    @model_validator(mode="after")
+    def _strip_recipient(self):
+        self.recipient = self.recipient.strip()
+        if not self.recipient:
+            raise ValueError("收件人不能为空")
+        return self
+
+
+class SignoffSubmitRequest(BaseModel):
+    """收件人凭一次性密钥在截止前提交签收结论。
+
+    decision=ACCEPT 签收；decision=REJECT 拒收且 reason 必填（非空白）。
+    每个归档包仅一份定稿：同邀请同内容重试（含截止后）返回首次结果；
+    不同内容或由其他邀请再提交报冲突。
+    """
+    key: str = Field(
+        ..., min_length=1, max_length=256,
+        description="创建邀请时一次性展示的随机签收密钥（仅该次出现）",
+    )
+    decision: Literal["ACCEPT", "REJECT"] = Field(
+        ..., description="ACCEPT=签收；REJECT=拒收（须填写 reason）"
+    )
+    reason: str | None = Field(
+        None, max_length=1024, description="拒收原因：REJECT 时必填（非空白）；ACCEPT 时忽略"
+    )
+
+    @model_validator(mode="after")
+    def _check_reject_reason(self):
+        if self.decision == "REJECT" and not (self.reason and self.reason.strip()):
+            raise ValueError("拒收(REJECT)必须填写非空的拒收原因 reason")
+        return self
+
+
 class CertificateOut(BaseModel):
     cert_no: str
     kind: CertKind
@@ -271,6 +322,27 @@ class DeliveryArchiveResponse(BaseModel):
     items: list[DeliveryArchiveItemOut] = Field(
         ..., description="各目标证书的交付凭据，按提交列表顺序返回"
     )
+
+
+class SignoffInvitationResponse(BaseModel):
+    invitation_no: str = Field(..., description="邀请编号（签收时随密钥一并提交）")
+    archive_no: str
+    recipient: str
+    deadline: datetime
+    created_at: datetime
+    key: str = Field(
+        ...,
+        description="一次性随机签收密钥，仅此一次展示；服务端仅保存其哈希，明文不持久化",
+    )
+
+
+class SignoffRecordResponse(BaseModel):
+    archive_no: str
+    recipient: str
+    decision: Literal["ACCEPT", "REJECT"]
+    reason: str | None = Field(None, description="拒收原因；ACCEPT 时为 null")
+    signed_at: datetime = Field(..., description="签收时刻（定稿时点）")
+    invitation_no: str = Field(..., description="定稿所使用的邀请编号")
 
 
 class ErrorBody(BaseModel):

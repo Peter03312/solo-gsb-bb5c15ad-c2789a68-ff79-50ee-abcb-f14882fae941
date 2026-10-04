@@ -19,5 +19,9 @@ class Settings(BaseSettings):
     app_host: str = "0.0.0.0"
     app_port: int = 8080
 
+    # 交付管理密钥：交付方创建签收邀请、查询定稿记录时必须携带（X-Admin-Key）；
+    # 生产部署务必通过环境变量覆盖默认值。
+    admin_key: str = "caltrace-admin"
+
 
 settings = Settings()

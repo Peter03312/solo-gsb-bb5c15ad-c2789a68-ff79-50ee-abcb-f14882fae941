@@ -34,6 +34,8 @@ services:
       DB_USER: ${POSTGRES_USER:-caltrace}
       DB_PASSWORD: ${POSTGRES_PASSWORD:-caltrace}
       APP_PORT: 8080
+      # 交付管理密钥（创建签收邀请/查询定稿用，X-Admin-Key 头携带）；生产请覆盖
+      ADMIN_KEY: ${ADMIN_KEY:-caltrace-admin}
     ports:
       - "${APP_PORT:-8080}:8080"
     restart: unless-stopped

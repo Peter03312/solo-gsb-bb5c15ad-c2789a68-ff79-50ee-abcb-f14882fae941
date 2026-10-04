@@ -1,7 +1,9 @@
 """数据访问与核心业务规则（全部在数据库事务中执行）。"""
 import hashlib
 import heapq
+import hmac
 import json
+import secrets
 from datetime import date, datetime, timezone
 
 import psycopg
@@ -1223,6 +1225,337 @@ def get_delivery_archive(conn, archive_no: str) -> dict:
     if row is None:
         raise ApiError(404, "archive_not_found", f"归档包不存在: {archive_no}")
     return row["response"]
+
+
+# ---------------------------------------------------------------------------
+# 交付签收（一次性密钥邀请 + 每包一份定稿：签收 ACCEPT / 拒收 REJECT）
+# ---------------------------------------------------------------------------
+
+# 一次性密钥指纹的固定域分隔前缀（即便与其他 SHA-256 用途碰撞也无法跨域复用）
+_SIGNOFF_KEY_DOMAIN = "caltrace-signoff-key/v1:"
+
+
+def _new_signoff_key() -> str:
+    """生成一次性随机签收密钥（secrets 模块 CSPRNG，32 字节）。"""
+    return secrets.token_hex(32)
+
+
+def _signoff_key_hash(key: str) -> str:
+    """一次性密钥的 SHA-256 指纹：明文不持久化，库内只保存该哈希。"""
+    return hashlib.sha256((_SIGNOFF_KEY_DOMAIN + key).encode("utf-8")).hexdigest()
+
+
+def _new_invitation_no() -> str:
+    """服务端生成邀请编号：INV- 前缀 + 12 字节随机十六进制（天然防枚举）。"""
+    return "INV-" + secrets.token_hex(12)
+
+
+def _signoff_submit_hash(decision: str, reason: str | None) -> str:
+    """规范化提交内容（结论 + 原因）指纹：键序无关的紧凑 JSON。"""
+    canonical = json.dumps(
+        {"decision": decision, "reason": reason},
+        sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _record_response(row: dict) -> dict:
+    """定稿记录对外结构：归档号、收件人、结论、原因与签收时刻（附邀请编号）。"""
+    return {
+        "archive_no": row["archive_no"],
+        "recipient": row["recipient"],
+        "decision": row["decision"],
+        "reason": row["reason"],
+        "signed_at": row["signed_at"],
+        "invitation_no": row["invitation_no"],
+    }
+
+
+def _get_signoff_record(conn, archive_no: str, lock: bool = False) -> dict | None:
+    sql = (
+        "SELECT archive_no, invitation_no, recipient, decision, reason, "
+        "request_hash, signed_at FROM signoff_records WHERE archive_no = %s"
+    )
+    if lock:
+        sql += " FOR UPDATE"
+    return conn.execute(sql, (archive_no,)).fetchone()
+
+
+def create_signoff_invitation(conn, req) -> dict:
+    """交付方（持管理密钥）创建签收邀请。
+
+    - 归档包必须存在，否则 404 archive_not_found；
+    - 截止时刻必须带时区且严格晚于当前时刻，否则 422；
+    - 同一归档包可创建多份邀请（重发/换人），每份独立的一次性密钥；
+    - 返回邀请编号与仅展示一次的随机密钥，库内仅保存密钥哈希，明文不落库。
+    """
+    if req.deadline.tzinfo is None or req.deadline.utcoffset() is None:
+        raise ApiError(
+            422,
+            "signoff_deadline_invalid",
+            "签收截止时刻必须携带时区（如 2026-10-10T18:00:00+08:00）",
+            details={"archive_no": req.archive_no, "deadline": req.deadline.isoformat()},
+        )
+    deadline = req.deadline.astimezone(timezone.utc)
+    if deadline <= datetime.now(timezone.utc):
+        raise ApiError(
+            422,
+            "signoff_deadline_not_future",
+            f"签收截止时刻必须晚于当前时刻：deadline={deadline.isoformat()}",
+            details={"archive_no": req.archive_no, "deadline": deadline.isoformat()},
+        )
+
+    with conn.transaction():
+        # 外键插入本身也会兜底，但先给出语义化的 404
+        if _get_delivery_archive_row(conn, req.archive_no) is None:
+            raise ApiError(
+                404, "archive_not_found",
+                f"归档包不存在，无法创建签收邀请: {req.archive_no}",
+                details={"archive_no": req.archive_no},
+            )
+        key = _new_signoff_key()
+        created_at = datetime.now(timezone.utc)
+        # 随机邀请编号碰撞概率可忽略（24 位十六进制）；极端碰撞时在 savepoint
+        # 内重取编号重试，避免污染外层事务（PostgreSQL 内语句出错后事务需回滚）。
+        for attempt in range(3):
+            invitation_no = _new_invitation_no()
+            try:
+                with conn.transaction():
+                    conn.execute(
+                        """
+                        INSERT INTO signoff_invitations
+                            (invitation_no, archive_no, recipient, deadline, key_hash, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            invitation_no, req.archive_no, req.recipient, deadline,
+                            _signoff_key_hash(key), created_at,
+                        ),
+                    )
+                break
+            except psycopg.errors.UniqueViolation:
+                if attempt == 2:
+                    raise
+    return {
+        "invitation_no": invitation_no,
+        "archive_no": req.archive_no,
+        "recipient": req.recipient,
+        "deadline": deadline,
+        "created_at": created_at,
+        "key": key,
+    }
+
+
+def _find_affected_signoff_targets(conn, cert_nos: list[str]) -> dict:
+    """ACCEPT 前复核：任一目标自身或其冻结追溯链中证书已撤销/失效则拒绝。
+
+    返回 (受影响目标编号, 撤销/失效证书明细)：
+      - 判定以归档快照中的冻结链为准（证书不可删除，逐节点查当前状态）；
+      - 调用方须先对目标及全部上游行加 FOR SHARE 锁，使本复核与并发撤销
+        对应同一个一致的提交时点（先撤销则此处拒绝，先签收则撤销被阻塞
+        到签收提交之后），之后撤销不再改写已定稿记录。
+    """
+    rows = conn.execute(
+        """
+        WITH RECURSIVE targets AS (
+            SELECT DISTINCT cert_no
+            FROM unnest(%s::text[]) AS t(cert_no)
+        ),
+        walk AS (
+            SELECT cert_no, parent_cert_no, 0 AS dist
+            FROM certificates
+            WHERE cert_no IN (SELECT cert_no FROM targets)
+            UNION ALL
+            SELECT c.cert_no, c.parent_cert_no, w.dist + 1
+            FROM certificates c JOIN walk w ON c.cert_no = w.parent_cert_no
+        )
+        SELECT DISTINCT c.cert_no, c.status::text AS status
+        FROM walk w JOIN certificates c ON c.cert_no = w.cert_no
+        """,
+        (cert_nos,),
+    ).fetchall()
+    status = {r["cert_no"]: r["status"] for r in rows}
+    affected: set[str] = set()
+    revoked_certs: dict[str, str] = {}
+    for no in cert_nos:
+        chain_sql = """
+            WITH RECURSIVE walk AS (
+                SELECT cert_no, parent_cert_no, 0 AS depth
+                FROM certificates WHERE cert_no = %s
+                UNION ALL
+                SELECT c.cert_no, c.parent_cert_no, w.depth - 1
+                FROM certificates c JOIN walk w ON c.cert_no = w.parent_cert_no
+            )
+            SELECT cert_no FROM walk ORDER BY depth ASC
+        """
+        chain_nos = [r["cert_no"] for r in conn.execute(chain_sql, (no,)).fetchall()]
+        bad = [n for n in chain_nos if status.get(n) in ("REVOKED", "INVALID")]
+        if bad:
+            affected.add(no)
+            for n in bad:
+                revoked_certs[n] = status[n]
+    return {
+        "targets": sorted(affected),
+        "certificates": [
+            {"cert_no": no, "status": revoked_certs[no]}
+            for no in sorted(revoked_certs)
+        ],
+    }
+
+
+def _replay_or_conflict_signoff(existing: dict, invitation_no: str, req_hash: str):
+    """归档包已有定稿：同邀请且同（归一化）内容 → 重放首次结果；否则 409 冲突。"""
+    if existing["invitation_no"] == invitation_no and existing["request_hash"] == req_hash:
+        return _record_response(existing), False
+    raise ApiError(
+        409,
+        "signoff_conflict",
+        f"归档包 {existing['archive_no']} 已有一份定稿记录，"
+        "不同内容或由其他邀请再提交均不允许",
+        details={
+            "archive_no": existing["archive_no"],
+            "existing_invitation_no": existing["invitation_no"],
+            "existing_decision": existing["decision"],
+        },
+    )
+
+
+def _submit_signoff_once(conn, invitation_no: str, req, req_hash: str) -> tuple[dict, bool]:
+    """单次事务完成签收提交，返回 (定稿记录, 是否首次定稿)。"""
+    with conn.transaction():
+        # 先锁定邀请行串行化同邀请并发提交；邀请/密钥均无效统一 401，不暴露存在性
+        invitation = conn.execute(
+            "SELECT invitation_no, archive_no, recipient, deadline, key_hash "
+            "FROM signoff_invitations WHERE invitation_no = %s FOR UPDATE",
+            (invitation_no,),
+        ).fetchone()
+        if invitation is None or not hmac.compare_digest(
+            invitation["key_hash"], _signoff_key_hash(req.key)
+        ):
+            raise ApiError(
+                401,
+                "signoff_unauthorized",
+                "邀请编号不存在或一次性密钥无效，无法签收",
+                details={"invitation_no": invitation_no},
+            )
+        archive_no = invitation["archive_no"]
+
+        # 每包一份定稿：已有定稿则同邀请同内容重放（截止后亦然），其余冲突
+        existing = _get_signoff_record(conn, archive_no, lock=True)
+        if existing is not None:
+            return _replay_or_conflict_signoff(existing, invitation_no, req_hash)
+
+        # 未定稿：过期邀请不能签收（密钥已验证有效）
+        now = datetime.now(timezone.utc)
+        if now >= invitation["deadline"]:
+            raise ApiError(
+                410,
+                "signoff_expired",
+                f"签收邀请已于 {invitation['deadline'].isoformat()} 截止，"
+                f"归档包 {archive_no} 尚未定稿，不能再签收",
+                details={
+                    "invitation_no": invitation_no,
+                    "archive_no": archive_no,
+                    "deadline": invitation["deadline"].isoformat(),
+                    "now": now.isoformat(),
+                },
+            )
+
+        # 归一化原因：ACCEPT 恒为 null（携带的 reason 不参与内容判定），
+        # REJECT 为去除首尾空白后的实际拒收原因。
+        reason = req.reason.strip() if req.decision == "REJECT" else None
+        if req.decision == "ACCEPT":
+            archive = _get_delivery_archive_row(conn, archive_no)
+            cert_nos = list(archive["cert_nos"])
+            # 与归档创建相同的祖先优先加锁顺序，和并发撤销之间不会形成等待环
+            _lock_delivery_universe(conn, cert_nos)
+            bad = _find_affected_signoff_targets(conn, cert_nos)
+            if bad["targets"]:
+                raise ApiError(
+                    422,
+                    "signoff_targets_revoked",
+                    "ACCEPT 被拒绝：包内目标证书或其冻结追溯链中存在已撤销(REVOKED)"
+                    "或已失效(INVALID)的证书；可改用 REJECT 拒收",
+                    details={
+                        "archive_no": archive_no,
+                        "affected_targets": bad["targets"],
+                        "revoked_certificates": bad["certificates"],
+                    },
+                )
+
+        signed_at = now
+        conn.execute(
+            """
+            INSERT INTO signoff_records
+                (archive_no, invitation_no, recipient, decision, reason,
+                 request_hash, signed_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                archive_no, invitation_no, invitation["recipient"],
+                req.decision, reason, req_hash, signed_at,
+            ),
+        )
+        row = _get_signoff_record(conn, archive_no)
+        return _record_response(row), True
+
+
+def submit_signoff(conn, invitation_no: str, req) -> tuple[dict, bool]:
+    """收件人提交签收结论，返回 (定稿记录, 是否首次定稿)。
+
+    - 邀请编号不存在或一次性密钥错误 → 401 signoff_unauthorized（不区分）；
+    - 每包只允许一份定稿：同一邀请同内容重试（即使已过截止时刻）原样返回
+      首次结果（HTTP 200）；不同内容或其他邀请再提交 → 409 signoff_conflict；
+    - 未定稿时，已过截止时刻 → 410 signoff_expired（过期或无效密钥均不能签收）；
+    - REJECT 必须填写非空白原因（模型层已校验）；ACCEPT 前对目标及其冻结
+      追溯链按当前（锁定的一致）状态复核，存在已撤销/已失效证书则 422
+      signoff_targets_revoked 并列出受影响目标；REJECT 不做该校验；
+    - 签收与撤销并发按提交顺序判定：ACCEPT 以 FOR SHARE 锁定链上证书行，
+      先签收则并发撤销被阻塞至签收提交之后（已定稿记录与归档快照不被改写），
+      先撤销则 ACCEPT 被拒绝。
+    """
+    # 与库内归一化一致：ACCEPT 原因恒为 null；REJECT 去首尾空白
+    norm_reason = req.reason.strip() if req.decision == "REJECT" else None
+    req_hash = _signoff_submit_hash(req.decision, norm_reason)
+    for attempt in range(3):
+        try:
+            return _submit_signoff_once(conn, invitation_no, req, req_hash)
+        except psycopg.errors.DeadlockDetected:
+            if attempt == 2:
+                raise ApiError(
+                    409,
+                    "signoff_busy",
+                    "签收与并发撤销竞争且重试耗尽，请稍后重试",
+                    details={"invitation_no": invitation_no},
+                )
+        except psycopg.errors.UniqueViolation:
+            # 不同邀请（各持自身邀请行锁）并发首提同一归档包：定稿主键兜底，
+            # 事务回滚后按已提交的定稿重放（理论上同内容）或判冲突。
+            inv = conn.execute(
+                "SELECT archive_no FROM signoff_invitations WHERE invitation_no = %s",
+                (invitation_no,),
+            ).fetchone()
+            if inv is None:  # 理论不可达（插入前已认证），防御性兜底
+                raise
+            existing = _get_signoff_record(conn, inv["archive_no"])
+            if existing is not None:
+                return _replay_or_conflict_signoff(existing, invitation_no, req_hash)
+            raise
+
+
+def get_signoff_record(conn, archive_no: str) -> dict:
+    """管理方按归档包编号查询定稿记录；包不存在 404，未定稿 404 signoff_not_found。"""
+    if _get_delivery_archive_row(conn, archive_no) is None:
+        raise ApiError(404, "archive_not_found", f"归档包不存在: {archive_no}")
+    row = _get_signoff_record(conn, archive_no)
+    if row is None:
+        raise ApiError(
+            404,
+            "signoff_not_found",
+            f"归档包 {archive_no} 尚无签收定稿记录",
+            details={"archive_no": archive_no},
+        )
+    return _record_response(row)
 
 
 # ---------------------------------------------------------------------------

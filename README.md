@@ -7,6 +7,9 @@
 录入有误时，可登记**更正声明**：声明按登记顺序生效、只增不改，原证书内容不受影响。
 证书撤销后，客服可按**撤销批次追查已交付凭据的影响面**：哪些交付归档包中的
 哪些目标证书，其归档时刻冻结的追溯链包含本批被撤销（含级联失效）的证书。
+交付方还可凭**本地管理密钥**按归档包、收件人与未来截止时刻创建**签收邀请**：
+返回邀请编号与仅展示一次的随机密钥（明文不落库）；收件人在截止前提交
+**ACCEPT/REJECT** 定稿，每包一份、不可改写，签收与撤销并发按提交顺序判定。
 面向监管与内审，还可按设备**审计过去半开区间内的校准覆盖**：按时间顺序还原
 完整、无重叠的合规与空窗片段，合规片段列出当时可用的合格普通证书编号。
 
@@ -83,6 +86,7 @@ docker compose down -v       # 停止并删除数据卷（下次启动重新初�
 | `POSTGRES_DB` | `caltrace` | 数据库名 |
 | `POSTGRES_PORT` | `127.0.0.1:5432` | 数据库在宿主机的绑定地址:端口 |
 | `DB_HOST` / `DB_PORT` | `db` / `5432` | API 容器内连接数据库用（compose 已固定） |
+| `ADMIN_KEY` | `caltrace-admin` | 交付管理密钥：创建签收邀请、查询定稿时以 `X-Admin-Key` 头携带，**生产必须覆盖** |
 
 ### 不用 Compose、直连已有 PostgreSQL
 
@@ -183,6 +187,40 @@ DB_HOST=127.0.0.1 DB_PORT=5432 DB_NAME=caltrace DB_USER=caltrace DB_PASSWORD=sec
     起止必须携带时区、起点必须早于终点、终点不得晚于查询时刻，否则
     `422 invalid_audit_window`。响应中的时间统一为 UTC（带时区 ISO 8601，
     与输入为同一时刻）。
+13. **交付归档包签收（一次性密钥邀请、每包一份定稿）**：交付方在请求头
+    `X-Admin-Key` 携带**本地配置的管理密钥**（环境变量 `ADMIN_KEY`，默认
+    `caltrace-admin`，生产必须覆盖），按**归档包编号、收件人和未来截止
+    时刻**创建签收邀请；服务生成随机**邀请编号**与**一次性随机密钥**并返回，
+    密钥仅在该次响应中出现，库内只保存其带域前缀的 SHA-256 指纹，**明文
+    不持久化**。归档包不存在 → `404 archive_not_found`；管理密钥缺失/错误
+    → `401 admin_key_invalid`；截止时刻缺时区 →
+    `422 signoff_deadline_invalid`，非严格未来值（等于或早于当前时刻）→
+    `422 signoff_deadline_not_future`。同一归档包可创建多份邀请（重发/换人）。
+    收件人提交 `ACCEPT` 或 `REJECT`（`REJECT` 必填非空白原因）：
+    - **认证**：邀请编号不存在与一次性密钥错误统一返回
+      `401 signoff_unauthorized`（不暴露邀请是否存在）；
+    - **每包一份定稿**：`signoff_records` 以归档包编号为主键、只增不改。
+      **同一邀请、同一内容**的重试返回首次定稿结果（HTTP 200，**截止后
+      亦然**）；**不同内容或由其他邀请再提交**均返回
+      `409 signoff_conflict`（含截止后）。内容按归一化判定：ACCEPT 恒无
+      原因（携带也忽略），REJECT 原因为去首尾空白后的值；
+    - **未定稿**：已过截止时刻 → `410 signoff_expired`（过期后即便密钥
+      正确也不能签收）；未定稿记录不产生；
+    - **ACCEPT 定稿前复核**：若包内任一目标证书、或其归档快照**冻结追溯
+      链**中的任一证书当前已撤销（REVOKED）或已失效（INVALID），ACCEPT 被
+      拒绝（`422 signoff_targets_revoked`），`details.affected_targets`
+      列出受影响目标编号、`details.revoked_certificates` 列出链上全部
+      已撤销/失效证书及其状态；**REJECT 不做该校验，仍可提交**；
+    - **签收与撤销并发按提交顺序判定**：ACCEPT 事务以与归档创建相同的
+      “祖先→下游”顺序对链上证书行加 `FOR SHARE` 共享锁，与撤销事务的
+      `FOR UPDATE` 互斥——签收先提交则定稿为 ACCEPT，之后撤销不改写签收
+      记录与归档快照；撤销先提交则 ACCEPT 被 `signoff_targets_revoked`
+      拒绝。跨邀请并发首提同一包由定稿主键兜底，仅一个事务成功，其余
+      `409 signoff_conflict`；
+    - 定稿记录返回**归档号、收件人、结论、原因（REJECT）和签收时刻**（附
+      定稿所用邀请编号），交付方可凭管理密钥
+      `GET /api/v1/delivery-archives/{archive_no}/signoff` 查询；包不存在
+      `404 archive_not_found`，未定稿 `404 signoff_not_found`。
 
 证书状态：`ACTIVE` 生效中 / `REVOKED` 被主动撤销 / `INVALID` 因上游撤销级联失效。
 
@@ -618,6 +656,124 @@ curl -sS 'http://localhost:8080/api/v1/devices/DEV-WS-A/coverage-audit?from=2026
 - 起止必须携带时区、起点必须早于终点、终点不得晚于查询时刻，否则
   `422 invalid_audit_window`；响应中的时间统一为 UTC（与输入为同一时刻）。
 
+### 16. 创建签收邀请（交付方·管理密钥，一次性密钥仅展示一次）
+
+交付方在 `X-Admin-Key` 头携带本地配置的管理密钥，按归档包编号、收件人与
+**未来**截止时刻创建邀请；响应中的 `key` 为一次性随机签收密钥，**仅此一次
+展示**，服务端只保存其哈希：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/signoff-invitations \
+  -H 'Content-Type: application/json' \
+  -H 'X-Admin-Key: caltrace-admin' \
+  -d '{
+    "archive_no": "DELIVERY-2026-10-03-001",
+    "recipient": "客户质检部-王工",
+    "deadline": "2026-10-10T18:00:00+08:00"
+  }'
+```
+
+响应 `201`（请立即把 `invitation_no` 与 `key` 通过安全渠道一次性转交收件人）：
+
+```json
+{
+  "invitation_no": "INV-28143a7eb21db8c741bd8bfe",
+  "archive_no": "DELIVERY-2026-10-03-001",
+  "recipient": "客户质检部-王工",
+  "deadline": "2026-10-10T10:00:00+00:00",
+  "created_at": "2026-10-04T03:12:45.123456+00:00",
+  "key": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}
+```
+
+拒绝场景：
+
+- 缺少或错误的管理密钥 → `401 admin_key_invalid`；
+- 归档包不存在 → `404 archive_not_found`；
+- `deadline` 不带时区 → `422 signoff_deadline_invalid`；
+  等于或早于当前时刻 → `422 signoff_deadline_not_future`。
+
+### 17. 收件人提交签收（ACCEPT / REJECT）
+
+在截止前，凭邀请编号（路径参数）与一次性密钥（请求体）提交。**无需管理
+密钥**——密钥本身即收件人的签收凭据。
+
+签收 ACCEPT：
+
+```bash
+curl -sS -X POST \
+  http://localhost:8080/api/v1/signoff-invitations/INV-28143a7eb21db8c741bd8bfe/submissions \
+  -H 'Content-Type: application/json' \
+  -d '{"key": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+       "decision": "ACCEPT"}'
+```
+
+拒收 REJECT（**必须填写非空白原因**）：
+
+```bash
+curl -sS -X POST \
+  http://localhost:8080/api/v1/signoff-invitations/INV-28143a7eb21db8c741bd8bfe/submissions \
+  -H 'Content-Type: application/json' \
+  -d '{"key": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+       "decision": "REJECT",
+       "reason": "到货后核对，外箱破损且证书编号与随货清单不一致"}'
+```
+
+首次定稿响应 `201`，包含**归档号、收件人、结论、原因和签收时刻**：
+
+```json
+{
+  "archive_no": "DELIVERY-2026-10-03-001",
+  "recipient": "客户质检部-王工",
+  "decision": "REJECT",
+  "reason": "到货后核对，外箱破损且证书编号与随货清单不一致",
+  "signed_at": "2026-10-04T03:20:11.654321+00:00",
+  "invitation_no": "INV-28143a7eb21db8c741bd8bfe"
+}
+```
+
+定稿、幂等与冲突约定：
+
+- **同一邀请同内容重试**（即使已过截止时刻）→ `200`，返回首次定稿；
+- **不同内容，或用其他邀请再提交**（含截止后）→ `409 signoff_conflict`；
+- 邀请编号未知或密钥错误 → `401 signoff_unauthorized`；
+- 尚未定稿且已过截止时刻 → `410 signoff_expired`；
+- `REJECT` 缺少/空白原因 → `422`（请求体校验）；
+- **ACCEPT 时**若包内目标证书或其冻结追溯链中任一证书已撤销/失效 →
+  `422 signoff_targets_revoked`，列出受影响目标；此时仍可改用 `REJECT`：
+
+```json
+{
+  "error": {
+    "code": "signoff_targets_revoked",
+    "message": "ACCEPT 被拒绝：包内目标证书或其冻结追溯链中存在已撤销(REVOKED)或已失效(INVALID)的证书；可改用 REJECT 拒收",
+    "details": {
+      "archive_no": "DELIVERY-2026-10-03-001",
+      "affected_targets": ["CAL-CUS-001"],
+      "revoked_certificates": [
+        {"cert_no": "CAL-CUS-001", "status": "INVALID"},
+        {"cert_no": "CAL-WS-001", "status": "INVALID"},
+        {"cert_no": "REF-MASTER-001", "status": "REVOKED"}
+      ]
+    }
+  }
+}
+```
+
+定稿一旦形成，之后证书再被撤销也**不改写签收记录与归档快照**；签收与撤销
+并发时按两者实际提交顺序判定（先签则保留 ACCEPT，先撤则 ACCEPT 被拒）。
+
+### 18. 查询签收定稿记录（交付方·管理密钥）
+
+```bash
+curl -sS http://localhost:8080/api/v1/delivery-archives/DELIVERY-2026-10-03-001/signoff \
+  -H 'X-Admin-Key: caltrace-admin' | python3 -m json.tool
+```
+
+返回与提交响应同构的定稿记录（归档号、收件人、结论、原因、签收时刻、邀请
+编号）；管理密钥缺失/错误 → `401 admin_key_invalid`；归档包不存在 →
+`404 archive_not_found`；包存在但尚未定稿 → `404 signoff_not_found`。
+
 ---
 
 ## 错误响应
@@ -626,7 +782,15 @@ curl -sS 'http://localhost:8080/api/v1/devices/DEV-WS-A/coverage-audit?from=2026
 
 | HTTP | code | 触发场景 |
 | --- | --- | --- |
-| 404 | `cert_not_found` / `device_not_found` / `revocation_not_found` / `batch_not_found` / `declaration_not_found` / `archive_not_found` | 目标不存在 |
+| 404 | `cert_not_found` / `device_not_found` / `revocation_not_found` / `batch_not_found` / `declaration_not_found` / `archive_not_found` / `signoff_not_found` | 目标不存在（`signoff_not_found` 表示包存在但尚无定稿） |
+| 401 | `admin_key_invalid` | 创建签收邀请/查询定稿时管理密钥缺失或错误 |
+| 401 | `signoff_unauthorized` | 邀请编号不存在或一次性密钥错误（统一报错，不暴露邀请存在性） |
+| 410 | `signoff_expired` | 归档包尚未定稿但邀请已过截止时刻（过期后正确密钥也不能签收） |
+| 409 | `signoff_conflict` | 每包一份定稿：不同内容或由其他邀请再提交（截止后同内容重试返回 200） |
+| 422 | `signoff_deadline_invalid` | 签收截止时刻未携带时区 |
+| 422 | `signoff_deadline_not_future` | 签收截止时刻等于或早于当前时刻（必须为严格未来值） |
+| 422 | `signoff_targets_revoked` | ACCEPT 时目标或冻结追溯链存在已撤销/失效证书（`details.affected_targets`/`revoked_certificates` 点名；可改用 REJECT） |
+| 409 | `signoff_busy` | 签收与并发撤销竞争且死锁重试耗尽（防御性兜底，调用方可重试） |
 | 409 | `cert_duplicate` | 证书编号已存在（含并发重复签发、批次与库内冲突） |
 | 409 | `batch_conflict` | 同一批次键提交了内容不同的签发请求 |
 | 409 | `correction_conflict` | 同一声明编号提交了内容不同的更正请求 |
@@ -666,7 +830,13 @@ python3 scripts/correction_checks.py  # 更正声明：顺序生效/显式置空
 python3 scripts/archive_checks.py     # 交付归档包：冻结快照/整包拒绝点名/重试/冲突/并发一致性
 python3 scripts/impact_checks.py      # 撤销影响面：命中判定/序位/稳定分页/空页/并发提交次序
 python3 scripts/coverage_checks.py    # 覆盖审计：计入窗口/撤销与级联截断/重签还原/空窗/参数错误
+python3 scripts/signoff_checks.py     # 签收：邀请/一次性密钥不落库/定稿幂等/冲突/过期/撤销并发
 ```
+
+> 各脚本使用固定业务编号、互不重入：重复运行请重建空库
+> （`docker compose down -v && docker compose up -d --build`）。签收脚本默认
+> 管理密钥取环境变量 `ADMIN_KEY`（缺省 `secret-admin-key`），本地直连时可用
+> `ADMIN_KEY=<你的密钥>` 覆盖。
 
 覆盖：基准登记、多级签发、无效引用、越界校准时刻、区间重叠（含首尾相接）、
 同编号并发与重叠区间并发（3 线程仅 1 成功）、中段撤销、级联失效、失效证书
@@ -696,4 +866,16 @@ ACTIVE，无新旧状态混合）、与并发更正（展示值只取某个已�
 覆盖、未来生效/签发时已过期/不合格/基准证书均不提供覆盖、未知设备
 整段空窗、子区间端点裁剪、片段完整无重叠且相邻不重复、不同时区表示
 同一时刻结果一致、起止无效/缺时区/终点晚于查询时刻报
-`422 invalid_audit_window`，以及既有证书/设备历史/撤销响应契约不变。
+`422 invalid_audit_window`，以及既有证书/设备历史/撤销响应契约不变；
+交付签收的管理密钥校验（缺失/错误 401）、包不存在 404、截止时刻缺时区
+与非未来值 422、邀请返回一次性随机密钥且**库内仅存哈希（直连核查明文
+不落库）**、同包多邀请、未知邀请/错误密钥统一 401、REJECT 必填原因、
+REJECT 定稿全字段、同邀请同内容重试（含截止后）返回首次结果、原因首尾
+空白归一化与 ACCEPT 携带多余原因的幂等、异内容/他邀请再提交冲突、
+未定稿过期 410 且无定稿、定稿查询 401/404/200、ACCEPT 定稿后撤销不改写
+签收记录与归档快照、ACCEPT 前目标或冻结追溯链已撤销/失效（基准撤销级联
+场景）拒绝并分类点名受影响目标与完好目标、此时 REJECT 仍可提交、
+同邀请 8 并发仅一定稿（一 201 余 200）、跨邀请 4 并发首提仅一定稿
+（一 201 余 409、无 5xx）、8 组链签收×撤销并发按提交顺序判定
+（先签后撤定稿保持 ACCEPT、先撤后签无定稿、零死锁零 500），
+以及既有签发/撤销/归档/影响面接口契约与健康检查不变。

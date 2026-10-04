@@ -15,19 +15,25 @@
 - GET    /api/v1/certificates/{cert_no}/corrections  证书更正视图（声明历史+合并展示）
 - POST   /api/v1/delivery-archives             创建客户交付归档包（冻结可交付凭据，编号幂等）
 - GET    /api/v1/delivery-archives/{archive_no}    按归档包编号查询创建时刻快照
+- POST   /api/v1/signoff-invitations           交付方创建签收邀请（管理密钥，一次性密钥仅展示一次）
+- POST   /api/v1/signoff-invitations/{invitation_no}/submissions  收件人提交 ACCEPT/REJECT
+- GET    /api/v1/delivery-archives/{archive_no}/signoff  管理方查询签收定稿记录
 - GET    /api/v1/devices/{device_id}/certificates  某设备全部证书（含历史）
 - GET    /api/v1/devices/{device_id}/coverage-audit  设备校准覆盖审计（合规/空窗片段）
 - GET    /api/v1/revocations                   撤销批次列表
 - GET    /api/v1/revocations/{batch_id}        撤销批次详情（受影响证书及引用链）
 - GET    /api/v1/revocations/{batch_id}/archive-impact  该批撤销对已交付归档凭据的影响面
 """
+import hmac
 from datetime import datetime
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from psycopg_pool import ConnectionPool
 
 from . import repository as repo
+from .config import settings
+from .errors import ApiError
 from .schemas import (
     BatchIssueRequest,
     CertificateIssueRequest,
@@ -35,6 +41,8 @@ from .schemas import (
     DeliveryArchiveRequest,
     ReferenceIssueRequest,
     RevokeRequest,
+    SignoffInvitationRequest,
+    SignoffSubmitRequest,
 )
 
 router = APIRouter(prefix="/api/v1")
@@ -160,6 +168,62 @@ def get_delivery_archive(archive_no: str, pool: ConnectionPool = Depends(pool_de
     """按归档包编号查询创建时刻快照；未知编号 404 archive_not_found。"""
     with pool.connection() as conn:
         return repo.get_delivery_archive(conn, archive_no)
+
+
+def require_admin_key(x_admin_key: str | None = Header(default=None)) -> None:
+    """交付管理密钥校验：创建签收邀请、查询定稿记录等管理操作必须携带 X-Admin-Key。"""
+    if x_admin_key is None or not hmac.compare_digest(x_admin_key, settings.admin_key):
+        raise ApiError(
+            401,
+            "admin_key_invalid",
+            "管理密钥缺失或错误：请在 X-Admin-Key 头中携带本地配置的管理密钥",
+        )
+
+
+@router.post(
+    "/signoff-invitations",
+    status_code=201,
+    dependencies=[Depends(require_admin_key)],
+)
+def create_signoff_invitation(
+    req: SignoffInvitationRequest, pool: ConnectionPool = Depends(pool_dep)
+):
+    """交付方创建签收邀请：返回邀请编号与仅展示一次的随机密钥（明文不持久化）。
+
+    归档包不存在 → 404 archive_not_found；截止时刻非未来值 → 422。
+    """
+    with pool.connection() as conn:
+        return repo.create_signoff_invitation(conn, req)
+
+
+@router.post("/signoff-invitations/{invitation_no}/submissions", status_code=201)
+def submit_signoff(
+    invitation_no: str,
+    req: SignoffSubmitRequest,
+    response: Response,
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """收件人在截止前凭一次性密钥提交 ACCEPT/REJECT（拒收须填原因）。
+
+    每包仅一份定稿：同邀请同内容重试（含截止后）返回首次结果（200）；
+    不同内容或其他邀请再提交 409；未定稿时过期 410；
+    ACCEPT 时目标或冻结追溯链存在已撤销/失效证书则 422 并列受影响目标。
+    """
+    with pool.connection() as conn:
+        body, created = repo.submit_signoff(conn, invitation_no, req)
+    if not created:
+        response.status_code = 200
+    return body
+
+
+@router.get(
+    "/delivery-archives/{archive_no}/signoff",
+    dependencies=[Depends(require_admin_key)],
+)
+def get_signoff_record(archive_no: str, pool: ConnectionPool = Depends(pool_dep)):
+    """管理方按归档包编号查询签收定稿记录；未定稿 404 signoff_not_found。"""
+    with pool.connection() as conn:
+        return repo.get_signoff_record(conn, archive_no)
 
 
 @router.get("/devices/{device_id}/certificates")
