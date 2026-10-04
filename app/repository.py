@@ -1,12 +1,15 @@
 """数据访问与核心业务规则（全部在数据库事务中执行）。"""
 import hashlib
 import heapq
+import hmac
 import json
+import secrets
 from datetime import date, datetime, timezone
 
 import psycopg
 from psycopg.types.json import Jsonb
 
+from .config import settings
 from .errors import ApiError
 
 # v_certificates 视图的列顺序
@@ -1223,6 +1226,373 @@ def get_delivery_archive(conn, archive_no: str) -> dict:
     if row is None:
         raise ApiError(404, "archive_not_found", f"归档包不存在: {archive_no}")
     return row["response"]
+
+
+# ---------------------------------------------------------------------------
+# 交付签收：邀请（一次性随机密钥）与定稿记录（每包唯一）
+# ---------------------------------------------------------------------------
+
+_INVITATION_NO_PREFIX = "DINV"
+_RECEIPT_KEY_BYTES = 24  # 192 位一次性随机密钥
+
+
+def _require_management_key(provided: str | None) -> None:
+    """校验交付方管理密钥（本地配置、不落库）。恒定时间比较，避免计时侧信道。"""
+    if not provided or not hmac.compare_digest(provided, settings.delivery_management_key):
+        raise ApiError(
+            401,
+            "invalid_management_key",
+            "管理密钥缺失或错误：创建签收邀请、查询定稿记录须在 X-Management-Key 头"
+            "中携带本地配置的交付管理密钥",
+        )
+
+
+def _hash_receipt_key(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def _as_utc(value: datetime) -> datetime:
+    """无时区时间按 UTC 处理（与 schemas 文档约定一致），统一为带时区 UTC。"""
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _get_invitation_row(conn, invitation_no: str) -> dict | None:
+    return conn.execute(
+        """
+        SELECT invitation_no, archive_no, recipient, deadline, key_hash, created_at
+        FROM delivery_invitations WHERE invitation_no = %s
+        """,
+        (invitation_no,),
+    ).fetchone()
+
+
+def _receipt_row(row: dict) -> dict:
+    return {
+        "archive_no": row["archive_no"],
+        "invitation_no": row["invitation_no"],
+        "recipient": row["recipient"],
+        "decision": row["decision"],
+        "reason": row["reason"],
+        "signed_at": row["signed_at"],
+    }
+
+
+def _get_receipt_by_archive(conn, archive_no: str) -> dict | None:
+    row = conn.execute(
+        """
+        SELECT archive_no, invitation_no, recipient, decision, reason, signed_at
+        FROM delivery_receipts WHERE archive_no = %s
+        """,
+        (archive_no,),
+    ).fetchone()
+    return _receipt_row(row) if row is not None else None
+
+
+def create_delivery_invitation(conn, req, management_key: str | None) -> tuple[dict, bool]:
+    """创建交付签收邀请，返回 (响应体, 是否首次创建)。
+
+    - 先验管理密钥（401 invalid_management_key），再验归档包存在
+      （404 archive_not_found）、截止时间为未来值（422 invitation_deadline_past）
+      与收件人非空白（422 invitation_recipient_required）；
+    - 服务端生成邀请编号与一次性随机密钥（secrets，192 位）：明文仅出现在
+      本次响应中，库内仅存 SHA-256（key_hash），明文不持久化、不记日志；
+    - 同一归档包可创建多份邀请；邀请一经创建只增不改；
+    - 邀请编号极小概率并发碰撞时由主键兜底重试生成新编号。
+    """
+    _require_management_key(management_key)
+    recipient = req.recipient.strip()
+    if not recipient:
+        raise ApiError(422, "invitation_recipient_required", "收件人不能为空")
+    deadline = _as_utc(req.deadline)
+    if not deadline > datetime.now(timezone.utc):
+        raise ApiError(
+            422,
+            "invitation_deadline_past",
+            "签收截止时间必须是未来时刻（须晚于当前时刻）",
+            details={"archive_no": req.archive_no, "deadline": deadline.isoformat()},
+        )
+    for _ in range(5):
+        invitation_no = f"{_INVITATION_NO_PREFIX}-{secrets.token_hex(8)}"
+        key = secrets.token_urlsafe(_RECEIPT_KEY_BYTES)
+        with conn.transaction():
+            if _get_delivery_archive_row(conn, req.archive_no) is None:
+                raise ApiError(
+                    404, "archive_not_found", f"归档包不存在: {req.archive_no}"
+                )
+            try:
+                row = conn.execute(
+                    """
+                    INSERT INTO delivery_invitations
+                        (invitation_no, archive_no, recipient, deadline, key_hash)
+                    VALUES (%s, %s, %s, %s, %s)
+                    RETURNING created_at
+                    """,
+                    (
+                        invitation_no,
+                        req.archive_no,
+                        recipient,
+                        deadline,
+                        _hash_receipt_key(key),
+                    ),
+                ).fetchone()
+            except psycopg.errors.UniqueViolation:
+                # 邀请编号极小概率碰撞：换一组新编号/密钥重试
+                continue
+            return {
+                "invitation_no": invitation_no,
+                "archive_no": req.archive_no,
+                "recipient": recipient,
+                "deadline": deadline,
+                "created_at": row["created_at"],
+                "key": key,
+            }, True
+    raise ApiError(500, "invitation_busy", "邀请编号生成连续碰撞，请稍后重试")
+
+
+def _receipt_request_hash(invitation_no: str, decision: str, reason: str | None) -> str:
+    """规范化提交指纹：同一邀请下区分结论与拒收原因；密钥不参与内容判定。"""
+    canonical = json.dumps(
+        {"invitation_no": invitation_no, "decision": decision, "reason": reason},
+        sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _receipt_blockers(conn, archive: dict) -> list[str]:
+    """ACCEPT 前置校验：包内任一目标自身、或其归档冻结追溯链中的任一证书
+    当前已撤销（REVOKED）或失效（INVALID），即返回受影响的包内目标编号。
+
+    状态读取的是当前 certificates 表（非快照）；链拓扑取归档快照，因此
+    “归档时合格、签收前链上证书被撤销/级联失效”的目标会被点名。
+    结果按目标编号排序去重。
+    """
+    targets: dict[str, set[str]] = {}
+    for item in archive["response"]["items"]:
+        no = item["cert_no"]
+        targets[no] = {
+            node["certificate"]["cert_no"] for node in item["chain"]["nodes"]
+        }
+        # 防御：保证目标自身恒在待查集合中（链按定义含目标，这里兜底）
+        targets[no].add(no)
+    universe = sorted({c for chain in targets.values() for c in chain})
+    bad = {
+        r["cert_no"]
+        for r in conn.execute(
+            "SELECT cert_no FROM certificates WHERE cert_no = ANY(%s) AND status <> 'ACTIVE'",
+            (universe,),
+        ).fetchall()
+    }
+    return sorted(no for no, chain in targets.items() if chain & bad)
+
+
+def _receipt_conflict(existing: dict, invitation_no: str, req_hash: str) -> dict:
+    """已定稿：同一邀请且同内容 → 重放首次定稿；否则 409 receipt_conflict。"""
+    if (
+        existing["invitation_no"] == invitation_no
+        and existing.get("request_hash") == req_hash
+    ):
+        return _receipt_row(existing)
+    raise ApiError(
+        409,
+        "receipt_conflict",
+        f"归档包 {existing['archive_no']} 已有定稿记录（邀请 "
+        f"{existing['invitation_no']}，结论 {existing['decision']}）："
+        "每个归档包只允许一份定稿；仅同一邀请同一内容的重试返回首次结果，"
+        "不同内容或其他邀请再提交一律冲突。",
+        details={
+            "archive_no": existing["archive_no"],
+            "finalized_invitation_no": existing["invitation_no"],
+            "finalized_decision": existing["decision"],
+        },
+    )
+
+
+def _submit_receipt_once(
+    conn, req, req_hash: str, *, key_hash: str, now: datetime
+) -> tuple[dict, bool]:
+    """单次事务尝试；返回 (定稿记录, 是否首次定稿)。"""
+    with conn.transaction():
+        invitation = _get_invitation_row(conn, req.invitation_no)
+        if invitation is None:
+            raise ApiError(
+                404, "invitation_not_found", f"签收邀请不存在: {req.invitation_no}"
+            )
+        if not hmac.compare_digest(invitation["key_hash"], key_hash):
+            raise ApiError(
+                401,
+                "invalid_receipt_key",
+                f"一次性签收密钥错误（邀请 {req.invitation_no}）",
+                details={"invitation_no": req.invitation_no},
+            )
+
+        # 先看是否已定稿：同邀请同内容（含截止后重放）原样返回首次结果
+        existing = conn.execute(
+            """
+            SELECT archive_no, invitation_no, recipient, decision, reason,
+                   signed_at, request_hash
+            FROM delivery_receipts WHERE archive_no = %s
+            """,
+            (invitation["archive_no"],),
+        ).fetchone()
+        if existing is not None:
+            return _receipt_conflict(existing, req.invitation_no, req_hash), False
+
+        # 未定稿：截止（含整刻）后不能签收，密钥正确也不行
+        if now >= invitation["deadline"]:
+            raise ApiError(
+                409,
+                "invitation_expired",
+                f"签收邀请 {req.invitation_no} 已于 {invitation['deadline'].isoformat()} 截止，"
+                "尚未定稿的邀请过期后不能签收",
+                details={
+                    "invitation_no": req.invitation_no,
+                    "archive_no": invitation["archive_no"],
+                    "deadline": invitation["deadline"].isoformat(),
+                    "submitted_at": now.isoformat(),
+                },
+            )
+
+        reason = req.reason
+        if req.decision == "REJECT":
+            if not reason or not reason.strip():
+                raise ApiError(
+                    422, "receipt_reason_required", "拒收(REJECT)必须填写非空拒收原因"
+                )
+        else:
+            reason = None
+
+        # 每包一份定稿：锁定归档包行，串行化同一包的并发定稿尝试
+        locked = conn.execute(
+            "SELECT archive_no FROM delivery_archives WHERE archive_no = %s FOR UPDATE",
+            (invitation["archive_no"],),
+        ).fetchone()
+        if locked is None:  # 理论不可达（邀请外键引用归档包），兜底
+            raise ApiError(
+                404, "archive_not_found", f"归档包不存在: {invitation['archive_no']}"
+            )
+
+        if req.decision == "ACCEPT":
+            archive = _get_delivery_archive_row(conn, invitation["archive_no"])
+            # 与归档创建相同的整链 FOR SHARE 锁定（追溯起点→下游顺序）：
+            # 并发撤销(FOR UPDATE)要么先提交（随后读取到非 ACTIVE，点名拒绝），
+            # 要么被阻塞到本事务提交之后（签收先于撤销成立），按提交次序判定。
+            _lock_delivery_universe(conn, archive["cert_nos"])
+            blockers = _receipt_blockers(conn, archive)
+            if blockers:
+                raise ApiError(
+                    422,
+                    "receipt_targets_revoked",
+                    "接收(ACCEPT)被拒绝：包内目标证书或其冻结追溯链中已有证书被撤销"
+                    "或失效；可改用 REJECT 提交（须填写原因）。受影响目标: "
+                    + ", ".join(blockers),
+                    details={
+                        "archive_no": invitation["archive_no"],
+                        "invitation_no": req.invitation_no,
+                        "affected_targets": blockers,
+                    },
+                )
+
+        conn.execute(
+            """
+            INSERT INTO delivery_receipts
+                (archive_no, invitation_no, recipient, decision, reason, request_hash, signed_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                invitation["archive_no"],
+                req.invitation_no,
+                invitation["recipient"],
+                req.decision,
+                reason,
+                req_hash,
+                now,
+            ),
+        )
+        return {
+            "archive_no": invitation["archive_no"],
+            "invitation_no": req.invitation_no,
+            "recipient": invitation["recipient"],
+            "decision": req.decision,
+            "reason": reason,
+            "signed_at": now,
+        }, True
+
+
+def submit_delivery_receipt(conn, req) -> tuple[dict, bool]:
+    """收件人在截止前提交签收结论，返回 (定稿记录, 是否首次定稿)。
+
+    - 邀请不存在 → 404 invitation_not_found；一次性密钥错误 →
+      401 invalid_receipt_key；未定稿且已过截止（含整刻）→
+      409 invitation_expired（过期/失效密钥均不能签收）；
+    - REJECT 必须填写非空原因（422 receipt_reason_required）；
+    - ACCEPT 时包内目标自身或其冻结追溯链中任一证书当前已撤销/失效 →
+      422 receipt_targets_revoked，details.affected_targets 点名受影响目标，
+      REJECT 不受此限制仍可提交；
+    - 每包一份定稿（delivery_receipts.archive_no 主键）：同一邀请同内容重试
+      （截止后亦然）返回首次定稿（HTTP 200）；不同内容或其他邀请再提交 →
+      409 receipt_conflict；并发定稿由主键兜底，后到事务回滚后按已提交
+      记录重放/判冲突；
+    - 与撤销并发按提交顺序判定：ACCEPT 事务对目标及全链按祖先优先加
+      FOR SHARE 锁（经 _receipt_blockers 的前置整链锁），撤销先提交则
+      本次 ACCEPT 点名受影响目标而拒绝，签收先提交则定稿成立；定稿后
+      的撤销不改写签收记录与归档快照（两表只增不改）。
+    """
+    req_hash = _receipt_request_hash(req.invitation_no, req.decision, req.reason)
+    key_hash = _hash_receipt_key(req.key)
+    for attempt in range(3):
+        try:
+            return _submit_receipt_once(conn, req, req_hash, key_hash=key_hash,
+                                        now=datetime.now(timezone.utc))
+        except psycopg.errors.DeadlockDetected:
+            # 与并发撤销的加锁等待环由死锁检测终止：整体回滚后重试
+            if attempt == 2:
+                raise ApiError(
+                    409,
+                    "receipt_busy",
+                    f"签收 {req.invitation_no} 与并发撤销竞争，重试后仍冲突，请稍后重试",
+                    details={"invitation_no": req.invitation_no},
+                )
+        except psycopg.errors.UniqueViolation:
+            # 并发定稿：主键兜底，后到事务回滚后按已提交记录重放/判冲突
+            invitation = _get_invitation_row(conn, req.invitation_no)
+            if invitation is None:
+                raise ApiError(
+                    404, "invitation_not_found", f"签收邀请不存在: {req.invitation_no}"
+                )
+            existing = conn.execute(
+                """
+                SELECT archive_no, invitation_no, recipient, decision, reason,
+                       signed_at, request_hash
+                FROM delivery_receipts WHERE archive_no = %s
+                """,
+                (invitation["archive_no"],),
+            ).fetchone()
+            if existing is not None:
+                return _receipt_conflict(existing, req.invitation_no, req_hash), False
+            raise
+    raise ApiError(500, "receipt_busy", "签收提交失败，请稍后重试")
+
+
+def get_delivery_receipt(conn, archive_no: str, management_key: str | None) -> dict:
+    """凭管理密钥按归档包编号查询定稿记录。
+
+    管理密钥错误 → 401 invalid_management_key；归档包不存在 →
+    404 archive_not_found；归档包存在但尚未定稿 → 404 receipt_not_found。
+    """
+    _require_management_key(management_key)
+    if _get_delivery_archive_row(conn, archive_no) is None:
+        raise ApiError(404, "archive_not_found", f"归档包不存在: {archive_no}")
+    receipt = _get_receipt_by_archive(conn, archive_no)
+    if receipt is None:
+        raise ApiError(
+            404,
+            "receipt_not_found",
+            f"归档包尚无签收录制: {archive_no}",
+            details={"archive_no": archive_no},
+        )
+    return receipt
 
 
 # ---------------------------------------------------------------------------

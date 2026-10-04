@@ -133,6 +133,38 @@ class DeliveryArchiveRequest(BaseModel):
     )
 
 
+class DeliveryInvitationRequest(BaseModel):
+    """创建交付签收邀请：归档包编号 + 收件人 + 未来截止时间。
+
+    交付方须在 X-Management-Key 头中携带本地配置的管理密钥。服务端生成
+    邀请编号与一次性随机密钥；随机密钥仅在本次响应中明文出现一次，
+    库内仅保存其 SHA-256 指纹。归档包不存在、管理密钥错误或截止时间
+    非未来值时拒绝创建。
+    """
+    archive_no: str = Field(..., min_length=1, max_length=128, description="已创建的归档包编号")
+    recipient: str = Field(
+        ..., min_length=1, max_length=256,
+        description="收件人标识（交付对象，如客户单位/联系人）",
+    )
+    deadline: datetime = Field(..., description="签收截止时刻（必须晚于当前时刻，带时区 ISO 8601）")
+
+
+class DeliveryReceiptRequest(BaseModel):
+    """收件人提交签收结论：邀请编号 + 创建邀请时一次性展示的随机密钥 + 结论。
+
+    必须在对应邀请的截止时刻之前提交；REJECT 必须填写非空 reason，
+    ACCEPT 不得携带原因。每包只允许一份定稿：同一邀请同内容重试返回
+    首次结果（截止后亦然），不同内容或其他邀请再提交均报冲突。
+    """
+    invitation_no: str = Field(..., min_length=1, max_length=128, description="邀请编号")
+    key: str = Field(..., min_length=1, max_length=256, description="创建邀请时仅展示一次的随机密钥")
+    decision: Literal["ACCEPT", "REJECT"] = Field(..., description="签收结论：ACCEPT 接收 / REJECT 拒收")
+    reason: str | None = Field(
+        None, max_length=1024,
+        description="拒收原因：REJECT 必填且非空；ACCEPT 不得填写",
+    )
+
+
 class CertificateOut(BaseModel):
     cert_no: str
     kind: CertKind
@@ -271,6 +303,28 @@ class DeliveryArchiveResponse(BaseModel):
     items: list[DeliveryArchiveItemOut] = Field(
         ..., description="各目标证书的交付凭据，按提交列表顺序返回"
     )
+
+
+class DeliveryInvitationResponse(BaseModel):
+    invitation_no: str
+    archive_no: str
+    recipient: str
+    deadline: datetime
+    created_at: datetime
+    key: str = Field(
+        ...,
+        description="一次性随机密钥（仅本次响应明文展示；库内仅存其 SHA-256，无法再次取回）",
+    )
+
+
+class DeliveryReceiptResponse(BaseModel):
+    """签收录制定稿记录：可凭管理密钥按归档包编号查询。"""
+    archive_no: str
+    invitation_no: str
+    recipient: str
+    decision: Literal["ACCEPT", "REJECT"]
+    reason: str | None = None
+    signed_at: datetime
 
 
 class ErrorBody(BaseModel):

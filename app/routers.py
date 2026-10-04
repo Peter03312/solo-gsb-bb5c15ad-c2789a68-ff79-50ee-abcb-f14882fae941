@@ -15,6 +15,9 @@
 - GET    /api/v1/certificates/{cert_no}/corrections  证书更正视图（声明历史+合并展示）
 - POST   /api/v1/delivery-archives             创建客户交付归档包（冻结可交付凭据，编号幂等）
 - GET    /api/v1/delivery-archives/{archive_no}    按归档包编号查询创建时刻快照
+- POST   /api/v1/delivery-invitations          交付方创建签收邀请（管理密钥，返回仅展示一次的随机密钥）
+- POST   /api/v1/delivery-receipts             收件人在截止前提交 ACCEPT/REJECT（每包一份定稿）
+- GET    /api/v1/delivery-archives/{archive_no}/receipt  凭管理密钥查询定稿记录
 - GET    /api/v1/devices/{device_id}/certificates  某设备全部证书（含历史）
 - GET    /api/v1/devices/{device_id}/coverage-audit  设备校准覆盖审计（合规/空窗片段）
 - GET    /api/v1/revocations                   撤销批次列表
@@ -24,7 +27,7 @@
 from datetime import datetime
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from psycopg_pool import ConnectionPool
 
 from . import repository as repo
@@ -33,6 +36,10 @@ from .schemas import (
     CertificateIssueRequest,
     CorrectionDeclarationRequest,
     DeliveryArchiveRequest,
+    DeliveryInvitationRequest,
+    DeliveryInvitationResponse,
+    DeliveryReceiptRequest,
+    DeliveryReceiptResponse,
     ReferenceIssueRequest,
     RevokeRequest,
 )
@@ -160,6 +167,68 @@ def get_delivery_archive(archive_no: str, pool: ConnectionPool = Depends(pool_de
     """按归档包编号查询创建时刻快照；未知编号 404 archive_not_found。"""
     with pool.connection() as conn:
         return repo.get_delivery_archive(conn, archive_no)
+
+
+@router.post("/delivery-invitations", status_code=201, response_model=DeliveryInvitationResponse)
+def create_delivery_invitation(
+    req: DeliveryInvitationRequest,
+    response: Response,
+    x_management_key: str | None = Header(
+        default=None,
+        alias="X-Management-Key",
+        description="交付方本地配置的管理密钥",
+    ),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """交付方创建签收邀请：按归档包编号、收件人与未来截止时间生成邀请编号与
+    一次性随机密钥。密钥仅在本次响应明文展示一次（库内只存 SHA-256）。
+
+    归档包不存在 404 archive_not_found、管理密钥错误 401 invalid_management_key、
+    截止时间非未来值 422 invitation_deadline_past。
+    """
+    with pool.connection() as conn:
+        body, _ = repo.create_delivery_invitation(conn, req, x_management_key)
+    return body
+
+
+@router.post("/delivery-receipts", status_code=201, response_model=DeliveryReceiptResponse)
+def submit_delivery_receipt(
+    req: DeliveryReceiptRequest,
+    response: Response,
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """收件人在截止前提交 ACCEPT/REJECT 定稿；REJECT 须填写原因。
+
+    每包一份定稿：同一邀请同内容重试（截止后亦然）返回首次结果（200）；
+    不同内容或其他邀请再提交 409 receipt_conflict。ACCEPT 时若包内目标或
+    冻结追溯链中任一证书已撤销/失效，422 receipt_targets_revoked 并点名
+    受影响目标；REJECT 不受此限。未定稿时过期 409 invitation_expired、
+    密钥错误 401 invalid_receipt_key、邀请未知 404 invitation_not_found。
+    """
+    with pool.connection() as conn:
+        body, created = repo.submit_delivery_receipt(conn, req)
+    if not created:
+        response.status_code = 200
+    return body
+
+
+@router.get("/delivery-archives/{archive_no}/receipt", response_model=DeliveryReceiptResponse)
+def get_delivery_receipt(
+    archive_no: str,
+    x_management_key: str | None = Header(
+        default=None,
+        alias="X-Management-Key",
+        description="交付方本地配置的管理密钥",
+    ),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """凭管理密钥按归档包编号查询定稿记录（归档号、收件人、结论、原因、签收时刻）。
+
+    管理密钥错误 401；归档包不存在 404 archive_not_found；
+    尚未定稿 404 receipt_not_found。
+    """
+    with pool.connection() as conn:
+        return repo.get_delivery_receipt(conn, archive_no, x_management_key)
 
 
 @router.get("/devices/{device_id}/certificates")

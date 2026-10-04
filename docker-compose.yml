@@ -33,6 +33,8 @@ services:
       DB_NAME: ${POSTGRES_DB:-caltrace}
       DB_USER: ${POSTGRES_USER:-caltrace}
       DB_PASSWORD: ${POSTGRES_PASSWORD:-caltrace}
+      # 交付方管理密钥：默认值仅供本机开发，生产请在 .env/环境中覆盖
+      DELIVERY_MANAGEMENT_KEY: ${DELIVERY_MANAGEMENT_KEY:-caltrace-delivery-admin}
       APP_PORT: 8080
     ports:
       - "${APP_PORT:-8080}:8080"

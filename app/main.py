@@ -33,12 +33,16 @@ app = FastAPI(
         "声明按登记顺序生效且不改写原证书；"
         "支持客户交付归档包：以归档包编号与非空证书编号列表冻结创建时刻的"
         "原始签发内容、追溯链与按更正声明合并的展示字段，编号幂等、可按编号查快照；"
+        "支持交付签收：交付方凭本地管理密钥按归档包/收件人/未来截止时间创建签收邀请，"
+        "返回邀请编号与仅展示一次的随机密钥（明文不落库）；收件人截止前提交 ACCEPT/REJECT，"
+        "每包一份定稿、同邀请同内容重试返回首次结果，ACCEPT 时目标或冻结链证书已撤销/"
+        "失效则拒绝并点名，定稿可凭管理密钥查询；"
         "支持按撤销批次追查已交付归档凭据的影响面（冻结链命中本批被撤销证书的"
         "归档包与包内目标证书，分页输出）；"
         "支持按设备审计过去半开区间内的校准覆盖：按时间顺序返回完整、无重叠的"
         "合规/空窗片段，合规片段列出当时可用的合格普通证书编号。"
     ),
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -89,6 +93,9 @@ def index():
             "GET  /api/v1/certificates/{cert_no}/corrections",
             "POST /api/v1/delivery-archives",
             "GET  /api/v1/delivery-archives/{archive_no}",
+            "POST /api/v1/delivery-invitations",
+            "POST /api/v1/delivery-receipts",
+            "GET  /api/v1/delivery-archives/{archive_no}/receipt",
             "GET  /api/v1/devices/{device_id}/certificates",
             "GET  /api/v1/devices/{device_id}/coverage-audit",
             "GET  /api/v1/revocations",
